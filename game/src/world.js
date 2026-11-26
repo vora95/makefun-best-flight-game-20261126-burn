@@ -1,223 +1,251 @@
-// Sunset Cargo Run — world: sea, islands, sky, sun, clouds, airstrips.
-// Terrain height is analytic (same function builds the meshes and drives the
-// physics), so the ground you see is the ground you land on.
+// The sunset archipelago: sky dome, low sun, sea with waves, four low-poly
+// islands with runways, palms and drifting clouds. All placement is seeded.
+
 import * as THREE from 'three';
-import { CONFIG, ISLANDS } from './config.js';
-
-export function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-export function smoothstep(a, b, x) {
-  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
-  return t * t * (3 - 2 * t);
-}
-
-export function islandHeightAt(isl, x, z) {
-  const d = Math.hypot(x - isl.x, z - isl.z);
-  return isl.H * (1 - smoothstep(isl.R * 0.3, isl.R, d));
-}
-
-export function heightAt(x, z) {
-  let h = 0;
-  for (const isl of ISLANDS) h = Math.max(h, islandHeightAt(isl, x, z));
-  return h;
-}
-
-// Strip hit test. Returns {island, along, across} or null.
-// along: distance along the strip from its centre; across: offset from centreline.
-export function stripAt(x, z) {
-  for (let i = 0; i < ISLANDS.length; i++) {
-    const isl = ISLANDS[i];
-    const hd = (isl.heading * Math.PI) / 180;
-    const dx = x - isl.x;
-    const dz = z - isl.z;
-    const along = dx * Math.sin(hd) + dz * Math.cos(hd);
-    const across = dx * Math.cos(hd) - dz * Math.sin(hd);
-    if (Math.abs(along) < isl.stripLen / 2 && Math.abs(across) < isl.stripWid / 2) {
-      return { island: i, along, across };
-    }
-  }
-  return null;
-}
-
-export function stripCenter(i) {
-  const isl = ISLANDS[i];
-  return { x: isl.x, y: isl.H, z: isl.z, heading: isl.heading };
-}
-
-function skyTexture() {
-  const c = document.createElement('canvas');
-  c.width = 4;
-  c.height = 256;
-  const g = c.getContext('2d');
-  const grad = g.createLinearGradient(0, 0, 0, 256);
-  grad.addColorStop(0.0, '#1c1445'); // deep violet zenith
-  grad.addColorStop(0.45, '#5b2a6e'); // purple
-  grad.addColorStop(0.72, '#c94f5e'); // rose
-  grad.addColorStop(0.88, '#ff8c42'); // orange horizon
-  grad.addColorStop(1.0, '#ffb35c'); // sunset glow
-  g.fillStyle = grad;
-  g.fillRect(0, 0, 4, 256);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
+import { SEED, mulberry32, ISLANDS, headingVec, clamp } from './config.js';
 
 export function buildWorld(scene) {
-  const rng = mulberry32(CONFIG.seed);
+  const rng = mulberry32(SEED);
 
-  // Sky dome (gradient) + sunset fog.
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(5200, 24, 16),
-    new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false })
-  );
-  scene.add(sky);
-  scene.fog = new THREE.Fog(0x8a4a5e, 1200, 4600);
+  scene.fog = new THREE.Fog(0x8a4a6b, 900, 4200);
 
-  // Low sun over the northern sea + warm directional light.
-  const sun = new THREE.Mesh(
-    new THREE.SphereGeometry(150, 24, 16),
-    new THREE.MeshBasicMaterial({ color: 0xffd27a, fog: false })
-  );
-  sun.position.set(-900, 260, -4200);
-  scene.add(sun);
-  const sunLight = new THREE.DirectionalLight(0xffb070, 2.6);
-  sunLight.position.set(-900, 500, -3000);
+  // --- lights: warm low sun + purple ambient fill ---
+  const sunLight = new THREE.DirectionalLight(0xffb36b, 2.4);
+  sunLight.position.set(-2600, 320, -900);
   scene.add(sunLight);
-  // Warm fill from the south so the plane's chase side and the terrain
-  // facing the camera are never pitch black.
-  const fillLight = new THREE.DirectionalLight(0xff9a6a, 0.7);
-  fillLight.position.set(600, 400, 2500);
-  scene.add(fillLight);
-  scene.add(new THREE.HemisphereLight(0x8a5aa8, 0x2a1a3a, 1.4));
-  scene.add(new THREE.AmbientLight(0x604060, 0.8));
+  scene.add(new THREE.HemisphereLight(0x9a6ab8, 0x2a4a5a, 1.25));
+  const fill = new THREE.DirectionalLight(0x9a6bff, 0.35);
+  fill.position.set(1200, 800, 1500);
+  scene.add(fill);
 
-  // Sea: large plane with gentle travelling waves (vertex animation).
+  // --- sky dome: vertex-coloured gradient, orange low to purple high ---
+  const skyGeo = new THREE.SphereGeometry(4200, 24, 14);
+  const pos = skyGeo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  const cTop = new THREE.Color(0x2e1250);
+  const cMid = new THREE.Color(0xc65a7a);
+  const cLow = new THREE.Color(0xff9a3d);
+  const tmp = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i) / 4200; // -1..1
+    if (y > 0.25) tmp.copy(cMid).lerp(cTop, clamp((y - 0.25) / 0.75, 0, 1));
+    else tmp.copy(cLow).lerp(cMid, clamp((y + 0.08) / 0.33, 0, 1));
+    colors[i * 3] = tmp.r;
+    colors[i * 3 + 1] = tmp.g;
+    colors[i * 3 + 2] = tmp.b;
+  }
+  skyGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const sky = new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false }));
+  scene.add(sky);
+
+  // --- the low sun: glowing disc + halo sprite (canvas texture, generated locally) ---
+  const sunGroup = new THREE.Group();
+  const sunDisc = new THREE.Mesh(
+    new THREE.CircleGeometry(150, 32),
+    new THREE.MeshBasicMaterial({ color: 0xffe9a8, fog: false }),
+  );
+  sunGroup.add(sunDisc);
+  const haloCanvas = document.createElement('canvas');
+  haloCanvas.width = haloCanvas.height = 256;
+  const hctx = haloCanvas.getContext('2d');
+  const grad = hctx.createRadialGradient(128, 128, 8, 128, 128, 128);
+  grad.addColorStop(0, 'rgba(255, 190, 90, 0.85)');
+  grad.addColorStop(0.45, 'rgba(255, 120, 60, 0.35)');
+  grad.addColorStop(1, 'rgba(255, 120, 60, 0)');
+  hctx.fillStyle = grad;
+  hctx.fillRect(0, 0, 256, 256);
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(haloCanvas), fog: false, depthWrite: false }));
+  halo.scale.set(1100, 1100, 1);
+  sunGroup.add(halo);
+  sunGroup.position.set(-3300, 330, -1100);
+  sunGroup.lookAt(0, 120, 0);
+  scene.add(sunGroup);
+
+  // --- sea: big low-poly plane, vertices wave in update() ---
   const seaGeo = new THREE.PlaneGeometry(7000, 7000, 48, 48);
   seaGeo.rotateX(-Math.PI / 2);
   const seaBase = seaGeo.attributes.position.array.slice();
   const sea = new THREE.Mesh(
     seaGeo,
-    new THREE.MeshPhongMaterial({ color: 0x274b7a, shininess: 90, specular: 0xff9a5a, flatShading: true })
+    new THREE.MeshLambertMaterial({ color: 0x2a6a8a, flatShading: true }),
   );
-  sea.position.y = 0;
+  sea.position.y = 0.1;
   scene.add(sea);
+  // A second, darker deep-water disc far out keeps the horizon from going flat.
+  const deep = new THREE.Mesh(
+    new THREE.CircleGeometry(6800, 40),
+    new THREE.MeshBasicMaterial({ color: 0x14324a, fog: false }),
+  );
+  deep.rotation.x = -Math.PI / 2;
+  deep.position.y = -0.6;
+  scene.add(deep);
 
-  // Islands: displaced grids, vertex colours sand -> grass -> rock.
-  const sand = new THREE.Color(0xd9b380);
-  const grass = new THREE.Color(0x4e8f4a);
-  const grass2 = new THREE.Color(0x6aa84f);
-  const rock = new THREE.Color(0x8a7a66);
+  // --- islands ---
+  const islands = [];
   for (const isl of ISLANDS) {
-    const geo = new THREE.PlaneGeometry(isl.R * 2.4, isl.R * 2.4, 22, 22);
-    geo.rotateX(-Math.PI / 2);
-    const pos = geo.attributes.position;
-    const colors = new Float32Array(pos.count * 3);
-    const tmp = new THREE.Color();
-    for (let i = 0; i < pos.count; i++) {
-      const wx = pos.getX(i) + isl.x;
-      const wz = pos.getZ(i) + isl.z;
-      const h = heightAt(wx, wz);
-      pos.setY(i, h);
-      const t = h / isl.H;
-      if (h < 2.5) tmp.copy(sand);
-      else if (t < 0.55) tmp.copy(grass).lerp(grass2, rng() * 0.6);
-      else tmp.copy(grass2).lerp(rock, (t - 0.55) / 0.45);
-      colors[i * 3] = tmp.r;
-      colors[i * 3 + 1] = tmp.g;
-      colors[i * 3 + 2] = tmp.b;
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true }));
-    mesh.position.set(isl.x, 0, isl.z);
-    scene.add(mesh);
+    const g = new THREE.Group();
+    g.position.set(isl.x, 0, isl.z);
 
-    // Airstrip: dark asphalt slab + centreline dashes + edge lights + windsock.
-    const strip = new THREE.Group();
-    const slab = new THREE.Mesh(
-      new THREE.BoxGeometry(isl.stripWid, 0.6, isl.stripLen),
-      new THREE.MeshLambertMaterial({ color: 0x33363e })
+    // Rock base: squat low-poly cone, sand rim, green top.
+    const rock = new THREE.Mesh(
+      new THREE.CylinderGeometry(isl.r * 0.62, isl.r * 1.02, isl.h, 9, 1),
+      new THREE.MeshLambertMaterial({ color: 0x8a6a4a, flatShading: true }),
     );
-    slab.position.y = 0.3;
-    strip.add(slab);
-    const dashMat = new THREE.MeshBasicMaterial({ color: 0xfff2cc });
-    for (let d = -isl.stripLen / 2 + 25; d < isl.stripLen / 2 - 10; d += 40) {
-      const dash = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.2, 18), dashMat);
-      dash.position.set(0, 0.7, d);
-      strip.add(dash);
+    rock.position.y = isl.h / 2 - 0.5;
+    g.add(rock);
+    const sand = new THREE.Mesh(
+      new THREE.CylinderGeometry(isl.r * 0.66, isl.r * 0.8, 1.6, 9),
+      new THREE.MeshLambertMaterial({ color: 0xd9b380, flatShading: true }),
+    );
+    sand.position.y = isl.h - 0.4;
+    g.add(sand);
+    const top = new THREE.Mesh(
+      new THREE.CylinderGeometry(isl.r * 0.62, isl.r * 0.66, 1.2, 9),
+      new THREE.MeshLambertMaterial({ color: isl.color, flatShading: true }),
+    );
+    top.position.y = isl.h + 0.2;
+    g.add(top);
+
+    // Runway: dark strip + white dashes + threshold bars, flat on the plateau.
+    const f = headingVec(isl.runwayHeading);
+    const runway = new THREE.Group();
+    runway.rotation.y = -Math.atan2(f.x, -f.z);
+    const strip = new THREE.Mesh(
+      new THREE.BoxGeometry(isl.runwayWid, 0.5, isl.runwayLen),
+      new THREE.MeshLambertMaterial({ color: 0x2e2a33 }),
+    );
+    strip.position.y = isl.h + 0.6;
+    runway.add(strip);
+    const dashMat = new THREE.MeshBasicMaterial({ color: 0xfff2c8 });
+    for (let d = -isl.runwayLen / 2 + 18; d < isl.runwayLen / 2 - 10; d += 26) {
+      const dash = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.2, 12), dashMat);
+      dash.position.set(0, isl.h + 0.95, d);
+      runway.add(dash);
     }
-    const lightMat = new THREE.MeshBasicMaterial({ color: 0xffb347 });
-    for (let d = -isl.stripLen / 2 + 10; d <= isl.stripLen / 2 - 10; d += 40) {
-      for (const side of [-1, 1]) {
-        const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.9, 8, 6), lightMat);
-        lamp.position.set((side * isl.stripWid) / 2, 1.0, d);
-        strip.add(lamp);
+    for (const s of [-1, 1]) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(isl.runwayWid - 4, 0.2, 4), dashMat);
+      bar.position.set(0, isl.h + 0.95, s * (isl.runwayLen / 2 - 8));
+      runway.add(bar);
+    }
+    // Edge lights: tiny warm dots so the strip reads at dusk.
+    const lightMat = new THREE.MeshBasicMaterial({ color: 0xffc46b });
+    for (let d = -isl.runwayLen / 2 + 6; d <= isl.runwayLen / 2 - 6; d += 30) {
+      for (const s of [-1, 1]) {
+        const dot = new THREE.Mesh(new THREE.SphereGeometry(0.9, 6, 6), lightMat);
+        dot.position.set(s * (isl.runwayWid / 2 + 1.5), isl.h + 1.2, d);
+        runway.add(dot);
       }
     }
-    // Windsock: pole + orange cone.
-    const pole = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.25, 0.25, 9, 6),
-      new THREE.MeshLambertMaterial({ color: 0xdddddd })
-    );
-    pole.position.set(isl.stripWid / 2 + 8, 4.5, isl.stripLen / 2 - 20);
-    strip.add(pole);
-    const sock = new THREE.Mesh(
-      new THREE.ConeGeometry(1.4, 5, 8),
-      new THREE.MeshLambertMaterial({ color: 0xff6a2a })
-    );
-    sock.rotation.z = Math.PI / 2;
-    sock.position.set(isl.stripWid / 2 + 8, 8.6, isl.stripLen / 2 - 20);
-    strip.add(sock);
+    g.add(runway);
 
-    strip.position.set(isl.x, isl.H + 0.1, isl.z);
-    strip.rotation.y = (isl.heading * Math.PI) / 180;
-    scene.add(strip);
+    // Windsock near the threshold.
+    const sock = new THREE.Group();
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 9, 6), new THREE.MeshLambertMaterial({ color: 0xcccccc }));
+    pole.position.y = 4.5;
+    sock.add(pole);
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(1.1, 4.5, 8),
+      new THREE.MeshLambertMaterial({ color: 0xff6b35 }),
+    );
+    cone.rotation.z = Math.PI / 2 - 0.35;
+    cone.position.set(2.4, 8.6, 0);
+    sock.add(cone);
+    sock.position.set(-f.x * (isl.runwayLen / 2 - 10) + -f.z * (isl.runwayWid / 2 + 12), isl.h + 0.8, -f.z * (isl.runwayLen / 2 - 10) + f.x * (isl.runwayWid / 2 + 12));
+    g.add(sock);
+
+    // Palms: seeded spots, kept clear of the runway strip.
+    const trunkMat = new THREE.MeshLambertMaterial({ color: 0x7a5230, flatShading: true });
+    const leafMat = new THREE.MeshLambertMaterial({ color: 0x2e7a3a, flatShading: true });
+    let placed = 0;
+    let guard = 0;
+    while (placed < isl.palms && guard < isl.palms * 12) {
+      guard++;
+      const a = rng() * Math.PI * 2;
+      const rr = isl.r * (0.3 + rng() * 0.55);
+      const px = Math.cos(a) * rr;
+      const pz = Math.sin(a) * rr;
+      const along = px * f.x + pz * f.z;
+      const across = px * -f.z + pz * f.x;
+      if (Math.abs(along) < isl.runwayLen / 2 + 14 && Math.abs(across) < isl.runwayWid / 2 + 12) continue;
+      const palm = new THREE.Group();
+      const lean = (rng() - 0.5) * 0.22;
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.55, 9, 5), trunkMat);
+      trunk.position.y = 4.5;
+      trunk.rotation.z = lean;
+      palm.add(trunk);
+      for (let k = 0; k < 5; k++) {
+        const frond = new THREE.Mesh(new THREE.ConeGeometry(1.5, 6.5, 4), leafMat);
+        const fa = (k / 5) * Math.PI * 2;
+        frond.position.set(Math.cos(fa) * 2.2, 9.6, Math.sin(fa) * 2.2);
+        frond.rotation.z = Math.cos(fa) * 1.1;
+        frond.rotation.x = -Math.sin(fa) * 1.1;
+        palm.add(frond);
+      }
+      const nut = new THREE.Mesh(new THREE.SphereGeometry(0.8, 6, 6), new THREE.MeshLambertMaterial({ color: 0x6b4a2a }));
+      nut.position.y = 8.6;
+      palm.add(nut);
+      palm.position.set(px, isl.h + 0.4, pz);
+      palm.rotation.y = rng() * Math.PI * 2;
+      const s = 0.8 + rng() * 0.6;
+      palm.scale.set(s, s, s);
+      g.add(palm);
+      placed++;
+    }
+
+    // A couple of low hills for silhouette.
+    for (let k = 0; k < 2; k++) {
+      const hill = new THREE.Mesh(
+        new THREE.ConeGeometry(isl.r * 0.22, isl.h * 0.9 + 4, 7),
+        new THREE.MeshLambertMaterial({ color: isl.color, flatShading: true }),
+      );
+      const ha = rng() * Math.PI * 2;
+      hill.position.set(Math.cos(ha) * isl.r * 0.35, isl.h + 2, Math.sin(ha) * isl.r * 0.35);
+      g.add(hill);
+    }
+
+    scene.add(g);
+    islands.push(g);
   }
 
-  // Clouds: pink-lit low-poly puffs drifting with the wind.
+  // --- clouds: flattened puffs, pink-lit, drifting slowly ---
   const clouds = [];
-  const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffd9c2, flatShading: true, transparent: true, opacity: 0.92 });
-  const cloudMat2 = new THREE.MeshLambertMaterial({ color: 0xc9a0d8, flatShading: true, transparent: true, opacity: 0.9 });
+  const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffc9a8, flatShading: true, transparent: true, opacity: 0.92 });
+  const cloudMat2 = new THREE.MeshLambertMaterial({ color: 0xe8a8c8, flatShading: true, transparent: true, opacity: 0.85 });
   for (let i = 0; i < 16; i++) {
-    const group = new THREE.Group();
+    const c = new THREE.Group();
     const puffs = 3 + Math.floor(rng() * 3);
-    for (let p = 0; p < puffs; p++) {
-      const r = 14 + rng() * 22;
-      const m = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 0), rng() > 0.5 ? cloudMat : cloudMat2);
-      m.position.set((rng() - 0.5) * 70, (rng() - 0.5) * 8, (rng() - 0.5) * 30);
-      m.scale.y = 0.45;
-      group.add(m);
+    for (let k = 0; k < puffs; k++) {
+      const p = new THREE.Mesh(new THREE.SphereGeometry(14 + rng() * 22, 7, 6), k % 2 ? cloudMat2 : cloudMat);
+      p.position.set((rng() - 0.5) * 70, (rng() - 0.5) * 8, (rng() - 0.5) * 26);
+      p.scale.y = 0.45;
+      c.add(p);
     }
-    group.position.set((rng() - 0.5) * 5200, 190 + rng() * 160, (rng() - 0.5) * 5200);
-    scene.add(group);
-    clouds.push(group);
+    const a = rng() * Math.PI * 2;
+    const rr = 500 + rng() * 2600;
+    c.position.set(Math.cos(a) * rr, 190 + rng() * 160, Math.sin(a) * rr);
+    c.userData.drift = 1.5 + rng() * 2.5;
+    scene.add(c);
+    clouds.push(c);
   }
 
   let waveTime = 0;
-  function update(dt) {
-    waveTime += dt;
-    const p = seaGeo.attributes.position;
-    for (let i = 0; i < p.count; i++) {
-      const bx = seaBase[i * 3];
-      const bz = seaBase[i * 3 + 2];
-      p.setY(i, Math.sin(bx * 0.012 + waveTime * 0.9) * 0.7 + Math.cos(bz * 0.009 + waveTime * 0.7) * 0.7);
-    }
-    p.needsUpdate = true;
-    seaGeo.computeVertexNormals();
-    for (const c of clouds) {
-      c.position.x += dt * 2.2;
-      if (c.position.x > 2800) c.position.x = -2800;
-    }
-  }
-
-  return { update, sun };
+  return {
+    update(t, dt) {
+      waveTime = t;
+      const p = seaGeo.attributes.position;
+      for (let i = 0; i < p.count; i++) {
+        const bx = seaBase[i * 3];
+        const bz = seaBase[i * 3 + 2];
+        p.array[i * 3 + 1] = Math.sin(bx * 0.012 + waveTime * 0.9) * 0.35 + Math.cos(bz * 0.014 + waveTime * 0.7) * 0.35;
+      }
+      p.needsUpdate = true;
+      // No computeVertexNormals: the sea material is flatShading, which shades
+      // from screen-space derivatives, so recomputing normals every frame was
+      // pure CPU cost (it was the slowest part of the frame in software GL).
+      for (const c of clouds) {
+        c.position.x += c.userData.drift * dt;
+        if (c.position.x > 3200) c.position.x = -3200;
+      }
+    },
+  };
 }

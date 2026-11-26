@@ -1,111 +1,154 @@
-// Sunset Cargo Run — shots: deterministic staged scenes for screenshots.
-// ?shot=menu|cruise|approach|delivery&seed=1 — each scene starts from a fresh
-// state and, where it moves, advances with the same fixed-step autopilot the
-// game itself uses, so the same seed always renders the same frame.
-import { ISLANDS, clamp, angleDiff } from './config.js';
-import { yawToTarget } from './flight.js';
-import { stripCenter } from './world.js';
+// Deterministic screenshot scenes: ?shot=menu|cruise|approach|delivery&seed=1
+// Each scene plays forward from a fresh state with a simple autopilot at fixed
+// steps, so the frame is real gameplay and the same seed gives the same frame.
+// Sets window.__shotReady = true when the frame is ready to capture.
 
-// Simple autopilot: bank toward the target bearing, hold a target altitude,
-// hold a target throttle. Returns a control object flight.js understands.
-export function autopilotInput(state, target, targetAlt, targetThrottle) {
-  const desiredYaw = yawToTarget(state, target.x, target.z);
-  const yawErr = angleDiff(state.yaw, desiredYaw);
-  const roll = clamp(-yawErr * 1.6, -1, 1);
-  const desiredPitch = clamp((targetAlt - state.pos.y) * 0.008, -0.15, 0.22);
-  const pitch = clamp((desiredPitch - state.pitch) * 4, -1, 1);
-  const throttle = clamp((targetThrottle - state.throttle) * 3, -1, 1);
-  return { throttle, roll, pitch, yaw: 0, brake: false };
+import { islandById, headingVec, clamp, angleDiff, deg2rad, rad2deg, WORLD } from './config.js';
+
+function steerTo(flight, tx, tz, targetAlt, targetSpeed, gearDown, flaps) {
+  const dx = tx - flight.x;
+  const dz = tz - flight.z;
+  const wantHeading = Math.atan2(dx, -dz);
+  const err = angleDiff(wantHeading, flight.heading);
+  const agl = flight.y - 10; // rough AGL over the islands
+  const altErr = targetAlt - agl;
+  let pitch = 0;
+  if (altErr > 6) pitch = 0.55;
+  else if (altErr > 2) pitch = 0.25;
+  else if (altErr < -6) pitch = -0.45;
+  else if (altErr < -2) pitch = -0.2;
+  else pitch = 0.05;
+  // The flight model loses ~9 m/s to full flaps and ~2 m/s to the gear, so the
+  // throttle must cover that drag or the plane sinks toward stall on final.
+  const drag = (flaps ? 9 : 0) + (gearDown ? 2 : 0);
+  // No throttle cap on descent: pitch alone sets the descent rate, and the
+  // throttle must keep holding the target speed — capping it to 0.3 on final
+  // starved the plane to 10 m/s and a -6.3 m/s slam (delivery scored 112).
+  const throttle = clamp((targetSpeed + drag) / WORLD.maxSpeed + (targetSpeed - flight.speed) * 0.05, 0, 1);
+  return {
+    roll: clamp(err * 2.2, -1, 1),
+    pitch: clamp(pitch / 0.34, -1, 1),
+    rudder: 0,
+    throttleAxis: 0,
+    throttleSet: throttle,
+    flaps,
+    gearDown,
+    brake: false,
+  };
 }
 
-// Prepare one shot scene. `game` is the live game object from main.js.
-// Returns { seconds, autopilot } — how long to simulate and with what mode.
-export function prepareShot(shot, game) {
-  const s = game.state;
-  const home = ISLANDS[0];
+export function applyShot(name, game) {
+  const { flight, missions } = game;
+  const shot = { name, simTime: 0, ready: false, camera: 'chase', phase: 0 };
+  window.__shotReady = false;
+  window.__shotName = name;
 
-  if (shot === 'menu') {
-    // Parked on the home runway at sunset, title screen up. The plane sits
-    // right of the runway centreline, nose turned, so the left-docked title
-    // card never covers it.
-    s.pos.x = 45;
-    s.pos.y = home.H + 1.4;
-    s.pos.z = 150;
-    s.yaw = Math.PI - 0.45;
-    s.pitch = 0;
-    s.roll = 0;
-    s.speed = 0;
-    s.throttle = 0;
-    s.airborne = false;
-    s.gearDown = true;
-    game.setMode('title');
-    document.body.classList.add('shot-menu');
-    return { seconds: 0, autopilot: null, camera: 'menu' };
+  const palm = islandById('palm');
+  const pf = headingVec(palm.runwayHeading);
+  // Threshold point (start of the Palm Cay strip) and the final-fix point.
+  const threshold = { x: palm.x - pf.x * (palm.runwayLen / 2), z: palm.z - pf.z * (palm.runwayLen / 2) };
+  const fix = (dist, alt) => ({
+    x: threshold.x - pf.x * dist,
+    z: threshold.z - pf.z * dist,
+    alt,
+  });
+
+  if (name === 'menu') {
+    flight.resetToRunway('home');
+    flight.throttle = 0.12;
+    missions.reset();
+    missions.say('', 0);
+    game.phase = 'title';
+    game.hud.show('title', { best: 0 });
+    shot.camera = 'menu';
+    shot.autopilot = () => {
+      flight.throttle = 0.12;
+      return { roll: 0, pitch: 0, rudder: 0, throttleAxis: 0, throttleSet: 0.12, flaps: 0, gearDown: true, brake: true };
+    };
+    shot.done = () => shot.simTime > 1.5;
+  } else if (name === 'cruise') {
+    missions.reset();
+    game.phase = 'flying';
+    game.hud.show('none');
+    // Mid-leg: 950 m out from Palm Cay, 130 m up, already fast.
+    const start = fix(950, 130);
+    const hd = Math.atan2(palm.x - start.x, -(palm.z - start.z));
+    flight.placeAirborne(start.x, 140, start.z, (hd * 180) / Math.PI, 42, 0.02);
+    flight.throttle = 0.75;
+    missions.say('LEG 1 — MEDICAL SUPPLIES TO PALM CAY', 999);
+    shot.autopilot = () => steerTo(flight, palm.x, palm.z, 130, 42, true, 0);
+    shot.done = () => shot.simTime > 13;
+  } else if (name === 'approach') {
+    missions.reset();
+    game.phase = 'flying';
+    game.hud.show('none');
+    const start = fix(720, 75);
+    const hd = palm.runwayHeading;
+    flight.placeAirborne(start.x, palm.h + 75, start.z, hd, 30, -0.06);
+    flight.throttle = 0.42;
+    flight.gearDown = true;
+    flight.flaps = 1;
+    missions.say('FINAL APPROACH — PALM CAY · GEAR DOWN · FLAPS', 999);
+    shot.autopilot = () => {
+      const dist = Math.hypot(threshold.x - flight.x, threshold.z - flight.z);
+      if (dist < 200) {
+        // Short final: hold the centreline, gentle descent to the threshold.
+        return steerTo(flight, threshold.x + pf.x * 60, threshold.z + pf.z * 60, 14, 26, true, 1);
+      }
+      return steerTo(flight, threshold.x, threshold.z, 45, 28, true, 1);
+    };
+    shot.done = () => {
+      const dist = Math.hypot(threshold.x - flight.x, threshold.z - flight.z);
+      return (dist < 230 && flight.y < palm.h + 42) || shot.simTime > 26;
+    };
+  } else if (name === 'delivery') {
+    missions.reset();
+    game.phase = 'flying';
+    game.hud.show('none');
+    const start = fix(380, 34);
+    flight.placeAirborne(start.x, palm.h + 34, start.z, palm.runwayHeading, 27, -0.05);
+    flight.throttle = 0.3;
+    flight.gearDown = true;
+    flight.flaps = 1;
+    missions.say('SHORT FINAL — PALM CAY', 999);
+    shot.autopilot = () => {
+      const dist = Math.hypot(threshold.x - flight.x, threshold.z - flight.z);
+      const agl = flight.y - palm.h;
+      if (agl < 6 && flight.onGround === false) {
+        // Flare: nearly level, power held at ~0.55 so the speed stays near
+        // 25 m/s — but KEEP steering: an earlier version forced roll 0 here
+        // and the crosswind drifted the plane ~8 m off the centreline in the
+        // last seconds, sometimes off the strip entirely (flaky landing).
+        const aimX = threshold.x + pf.x * 80;
+        const aimZ = threshold.z + pf.z * 80;
+        const wantHeading = Math.atan2(aimX - flight.x, -(aimZ - flight.z));
+        const err = angleDiff(wantHeading, flight.heading);
+        return { roll: clamp(err * 2.2, -1, 1), pitch: -0.15, rudder: 0, throttleAxis: 0, throttleSet: 0.55, flaps: 1, gearDown: true, brake: false };
+      }
+      // Glide slope: target altitude shrinks with distance to the aim point
+      // (80 m past the threshold) and reaches ZERO there, so the plane keeps
+      // descending onto the strip instead of holding altitude above it.
+      const aimDist = Math.hypot(threshold.x + pf.x * 80 - flight.x, threshold.z + pf.z * 80 - flight.z);
+      const slopeAlt = clamp(aimDist * 0.055, 0, 40);
+      return steerTo(flight, threshold.x + pf.x * 80, threshold.z + pf.z * 80, slopeAlt, 25, true, 1);
+    };
+    shot.done = () => {
+      if (game.phase === 'result' && shot.simTime - (shot.resultAt || 0) > 1.0 && shot.resultAt) return true;
+      if (game.phase === 'result' && !shot.resultAt) shot.resultAt = shot.simTime;
+      return shot.simTime > 26;
+    };
+  } else {
+    // Unknown shot: fall back to the menu scene.
+    return applyShot('menu', game);
   }
 
-  if (shot === 'cruise') {
-    // Mid-leg 1, climbing out over the sea toward Palm Cay, HUD live.
-    const dest = stripCenter(1);
-    s.pos.x = 0;
-    s.pos.y = 190;
-    s.pos.z = -200;
-    s.yaw = yawToTarget(s, dest.x, dest.z);
-    s.pitch = 0.05;
-    s.roll = 0;
-    s.speed = 42;
-    s.throttle = 0.7;
-    s.airborne = true;
-    s.gearDown = false;
-    s.fuel = 82;
-    game.setMode('flying');
-    return { seconds: 14, autopilot: 'cruise', camera: 'chase' };
-  }
-
-  if (shot === 'approach') {
-    // Final approach to Palm Cay: gear down, flaps down, strip ahead.
-    const dest = stripCenter(1);
-    s.pos.x = dest.x + 600; // east of the strip, flying west onto it
-    s.pos.y = dest.y + 75;
-    s.pos.z = dest.z;
-    s.yaw = yawToTarget(s, dest.x, dest.z);
-    s.pitch = -0.06;
-    s.roll = 0;
-    s.speed = 30;
-    s.throttle = 0.45;
-    s.airborne = true;
-    s.gearDown = true;
-    s.flaps = true;
-    s.fuel = 61;
-    game.setMode('flying');
-    return { seconds: 8, autopilot: 'approach', camera: 'chase' };
-  }
-
-  if (shot === 'delivery') {
-    // Just touched down on Palm Cay: cargo delivered, leg result on screen.
-    const dest = stripCenter(1);
-    s.pos.x = dest.x - 40;
-    s.pos.y = dest.y + 1.4;
-    s.pos.z = dest.z;
-    s.yaw = -Math.PI / 2; // aligned with the east-west strip
-    s.pitch = 0;
-    s.roll = 0;
-    s.speed = 6;
-    s.throttle = 0;
-    s.airborne = false;
-    s.gearDown = true;
-    s.flaps = true;
-    s.fuel = 100;
-    game.landNow(1, { island: 1, centerOffset: 3.2, speed: 26, vy: -2.0 });
-    return { seconds: 0, autopilot: null, camera: 'chase' };
-  }
-
-  return { seconds: 0, autopilot: null, camera: 'chase' };
-}
-
-// Autopilot target for a given mode, from the live mission.
-export function autopilotTarget(game, kind) {
-  const dest = stripCenter(1); // leg 1 destination in both moving shots
-  if (kind === 'cruise') return { target: dest, alt: dest.y + 170, throttle: 0.7 };
-  // Approach: aim at the eastern threshold, a little above the strip.
-  return { target: { x: dest.x + 130, z: dest.z }, alt: dest.y + 30, throttle: 0.42 };
+  shot.tick = (dt) => {
+    shot.simTime += dt;
+    if (!shot.ready && shot.done()) {
+      shot.ready = true;
+      window.__shotReady = true;
+    }
+  };
+  game.shot = shot;
+  return shot;
 }

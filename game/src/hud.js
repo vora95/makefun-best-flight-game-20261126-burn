@@ -1,117 +1,116 @@
-// Sunset Cargo Run — HUD + screens (DOM overlay, bright on dark panels so it
-// reads in screenshots): instruments, cargo manifest, messages, title / pause /
-// leg-result / mission-complete / game-over screens.
-import { ISLANDS, LEGS, yawToHeading } from './config.js';
-import { currentLeg, destinationName } from './missions.js';
+// HUD + screens: bright, readable instruments and overlays, all DOM so they
+// stay crisp in screenshots. index.html owns the markup; this owns the values.
 
-export class HUD {
-  constructor(doc) {
-    this.doc = doc;
-    const $ = (id) => doc.getElementById(id);
-    this.el = {
-      alt: $('hud-alt'), spd: $('hud-spd'), hdg: $('hud-hdg'),
-      fuelFill: $('fuel-fill'), fuelText: $('fuel-text'),
-      wind: $('hud-wind'), score: $('hud-score'), time: $('hud-time'),
-      leg: $('hud-leg'), dest: $('hud-dest'), cargo: $('hud-cargo'),
-      dmg: $('hud-dmg'), msg: $('hud-msg'),
-      gear: $('hud-gear'), flaps: $('hud-flaps'),
-      screens: {
-        title: $('screen-title'), pause: $('screen-pause'), leg: $('screen-leg'),
-        complete: $('screen-complete'), over: $('screen-over'),
-      },
-      legTitle: $('leg-title'), legBody: $('leg-body'),
-      completeBody: $('complete-body'), overBody: $('over-body'),
-      finalScore: $('final-score'),
+export class Hud {
+  constructor() {
+    this.el = (id) => document.getElementById(id);
+    this.lastMsg = '';
+  }
+
+  /** Per-frame instrument update. state: { flight, missions, phase, time } */
+  update(state) {
+    const { flight, missions } = state;
+    const set = (id, v) => {
+      const e = this.el(id);
+      if (e && e.textContent !== v) e.textContent = v;
     };
-    this.msgUntil = 0;
+    set('hud-alt', `${Math.round(flight.altitudeFt)} ft`);
+    set('hud-spd', `${Math.round(flight.speedKt)} kt`);
+    set('hud-hdg', `${String(Math.round(flight.headingDeg)).padStart(3, '0')}°`);
+    set('hud-vs', `${flight.vspeed >= 0 ? '+' : ''}${(flight.vspeed * 196.85).toFixed(0)} fpm`);
+    set('hud-thr', `${Math.round(flight.throttle * 100)}%`);
+    set('hud-score', String(missions.score));
+    set('hud-time', fmtTime(missions.elapsed));
+    set('hud-damage', `${missions.damage}/3`);
+    set('hud-gear', flight.gearDown ? 'GEAR DOWN' : 'GEAR UP');
+    set('hud-flaps', flight.flaps > 0 ? 'FLAPS' : 'FLAPS UP');
+    set('hud-wind', missions.done ? '—' : missions.windLabel());
+
+    const fuelBar = this.el('hud-fuel-fill');
+    if (fuelBar) {
+      fuelBar.style.width = `${missions.fuel.toFixed(1)}%`;
+      fuelBar.style.background = missions.fuel > 35 ? '#37d67a' : missions.fuel > 15 ? '#ffb020' : '#ff4444';
+    }
+    set('hud-fuel-text', `${Math.round(missions.fuel)}%`);
+
+    // Cargo manifest.
+    const leg = missions.leg;
+    if (leg) {
+      set('hud-leg', `LEG ${missions.legIndex + 1}/3`);
+      set('hud-dest', missions.dest.name.toUpperCase());
+      set('hud-cargo', `${leg.cargo} · ${leg.weight}`);
+      const dist = Math.round(flight.distanceTo(missions.dest));
+      const brg = Math.round(flight.bearingTo(missions.dest));
+      set('hud-dist', `${dist} m · BRG ${String(brg).padStart(3, '0')}°`);
+    } else {
+      set('hud-leg', 'DONE');
+      set('hud-dest', 'ALL DELIVERED');
+      set('hud-cargo', '—');
+      set('hud-dist', '—');
+    }
+
+    // Mission message banner.
+    const msg = state.phase === 'flying' && missions.elapsed < missions.messageUntil ? missions.message : '';
+    const banner = this.el('hud-msg');
+    if (banner && msg !== this.lastMsg) {
+      banner.textContent = msg;
+      banner.style.display = msg ? 'block' : 'none';
+      this.lastMsg = msg;
+    }
+
+    // Fuel warning flash.
+    const fuelBox = this.el('hud-fuel');
+    if (fuelBox) fuelBox.classList.toggle('low', missions.fuel <= 15 && state.phase === 'flying');
   }
 
-  show(name) {
-    for (const [key, el] of Object.entries(this.el.screens)) {
-      if (el) el.style.display = key === name ? 'flex' : 'none';
+  /** Show one screen overlay, hide the rest. name: title|pause|result|complete|gameover|none */
+  show(name, data = {}) {
+    for (const s of ['title', 'pause', 'result', 'complete', 'gameover']) {
+      const e = this.el(`screen-${s}`);
+      if (e) e.style.display = s === name ? 'flex' : 'none';
+    }
+    const hud = this.el('hud');
+    if (hud) hud.style.display = name === 'none' || name === 'pause' ? 'block' : name === 'result' ? 'block' : 'block';
+    if (name === 'result' && data.rec) {
+      const r = data.rec;
+      const set = (id, v) => {
+        const e = this.el(id);
+        if (e) e.textContent = v;
+      };
+      set('res-title', `CARGO DELIVERED — ${r.dest.toUpperCase()}`);
+      set('res-cargo', `${r.cargo}`);
+      set('res-centre', `${r.centre}/300`);
+      set('res-speed', `${r.speed}/250`);
+      set('res-soft', `${r.soft}/250`);
+      set('res-total', `+${r.total}`);
+      set('res-detail', r.detail);
+      set('res-next', data.next ? `Next leg: ${data.next}` : 'All cargo delivered!');
+    }
+    if (name === 'complete' && data.total !== undefined) {
+      const set = (id, v) => {
+        const e = this.el(id);
+        if (e) e.textContent = v;
+      };
+      set('cmp-score', String(data.total));
+      set('cmp-bonus', `Time bonus +${data.bonus}`);
+      set('cmp-time', fmtTime(data.time));
+      set('cmp-legs', data.legs.map((l) => `Leg ${l.leg} ${l.dest}: ${l.total}/800`).join('  ·  '));
+    }
+    if (name === 'gameover' && data.reason) {
+      const e = this.el('go-reason');
+      if (e) e.textContent = data.reason;
+      const s = this.el('go-score');
+      if (s) s.textContent = `Score ${data.score} · Leg ${Math.min(data.leg + 1, 3)}/3`;
+    }
+    if (name === 'title' && data.best !== undefined) {
+      const e = this.el('title-best');
+      if (e) e.textContent = data.best > 0 ? `Best score: ${data.best}` : '';
     }
   }
+}
 
-  hideAll() {
-    this.show(null);
-  }
-
-  message(text, seconds = 4) {
-    if (!this.el.msg) return;
-    this.el.msg.textContent = text;
-    this.el.msg.style.opacity = '1';
-    this.msgUntil = performance.now() / 1000 + seconds;
-  }
-
-  update(state, mission, mode) {
-    const e = this.el;
-    if (e.alt) e.alt.textContent = `${Math.round(state.pos.y * 3.28)} ft`;
-    if (e.spd) e.spd.textContent = `${Math.round(state.speed * 1.944)} kt`;
-    if (e.hdg) e.hdg.textContent = `${String(Math.round(yawToHeading(state.yaw))).padStart(3, '0')}°`;
-    if (e.fuelFill) {
-      e.fuelFill.style.width = `${Math.max(0, state.fuel)}%`;
-      e.fuelFill.style.background = state.fuel > 30 ? '#37d67a' : state.fuel > 12 ? '#ffb347' : '#ff4d4d';
-    }
-    if (e.fuelText) e.fuelText.textContent = `FUEL ${Math.round(state.fuel)}%`;
-    if (e.wind) e.wind.textContent = `WIND ${currentLeg(mission) ? currentLeg(mission).wind.label : 'calm'}`;
-    if (e.score) e.score.textContent = `SCORE ${mission.score}`;
-    if (e.time) {
-      const t = Math.floor(state.time);
-      e.time.textContent = `TIME ${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
-    }
-    const leg = currentLeg(mission);
-    if (e.leg) e.leg.textContent = mission.done ? 'ALL DELIVERED' : `LEG ${mission.legIndex + 1}/3`;
-    if (e.dest) e.dest.textContent = mission.done ? 'MISSION COMPLETE' : `DEST: ${destinationName(mission)}`;
-    if (e.cargo) e.cargo.textContent = leg ? `CARGO: ${leg.cargo}` : '';
-    if (e.dmg) e.dmg.textContent = `DAMAGE ${'▮'.repeat(state.damage)}${'▯'.repeat(3 - state.damage)}`;
-    if (e.gear) e.gear.textContent = state.gearDown ? 'GEAR DOWN' : 'GEAR UP';
-    if (e.flaps) e.flaps.textContent = state.flaps ? 'FLAPS DOWN' : 'FLAPS UP';
-    if (this.msgUntil && performance.now() / 1000 > this.msgUntil && this.el.msg) {
-      this.el.msg.style.opacity = '0.25';
-    }
-    // Manifest list on the title screen.
-    const manifest = this.doc.getElementById('manifest-list');
-    if (manifest && !manifest.dataset.filled) {
-      manifest.dataset.filled = '1';
-      manifest.innerHTML = LEGS.map(
-        (l, i) => `<div>LEG ${i + 1} — ${ISLANDS[l.from].short} → ${ISLANDS[l.to].name.toUpperCase()} · ${l.cargo}</div>`
-      ).join('');
-    }
-  }
-
-  showLegResult(rec, mission) {
-    const e = this.el;
-    if (e.legTitle) e.legTitle.textContent = `CARGO DELIVERED — ${rec.island.toUpperCase()}`;
-    if (e.legBody) {
-      e.legBody.innerHTML =
-        `<div>LEG ${rec.leg} SCORE <b>+${rec.points}</b></div>` +
-        `<div>Centreline offset: ${rec.centerOffset.toFixed(1)} m</div>` +
-        `<div>Touchdown: ${(rec.speed * 1.944).toFixed(0)} kt · sink ${(Math.abs(rec.vy) * 3.28).toFixed(0)} ft/s</div>` +
-        `<div>Refuelled to 100% — total score ${mission.score}</div>`;
-    }
-    this.show('leg');
-  }
-
-  showComplete(mission, state) {
-    const e = this.el;
-    if (e.completeBody) {
-      e.completeBody.innerHTML =
-        `<div>All 3 cargo legs delivered before sunset.</div>` +
-        `<div>Deliveries: ${mission.deliveries.map((d) => `LEG ${d.leg} +${d.points}`).join(' · ')}</div>` +
-        `<div>Time bonus: +${mission.timeBonus} · Damage: ${state.damage}/3</div>`;
-    }
-    if (e.finalScore) e.finalScore.textContent = `FINAL SCORE ${mission.score}`;
-    this.show('complete');
-  }
-
-  showGameOver(reason, mission) {
-    const e = this.el;
-    if (e.overBody) {
-      e.overBody.innerHTML =
-        `<div>${reason}</div>` +
-        `<div>Damage 3/3 — the bush plane is grounded.</div>` +
-        `<div>Deliveries made: ${mission.landings}/3 · Score ${mission.score}</div>`;
-    }
-    this.show('over');
-  }
+export function fmtTime(sec) {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }

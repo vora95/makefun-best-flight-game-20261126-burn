@@ -1,285 +1,340 @@
-// Sunset Cargo Run — bootstrap + game loop.
-// Fixed-step simulation (1/60 s) so keyboard play, autopilot shots and the
-// playtest all step the same physics. Rendering is plain Three.js.
+// Sunset Cargo Run — bootstrap, game loop, chase camera and the state machine
+// (title → flying → leg result → complete / game over). Shot mode is driven
+// by shots.js; the live game is driven by the keyboard.
+
 import * as THREE from 'three';
-import { CONFIG, ISLANDS, LEGS, clamp } from './config.js';
+import { SEED, clamp, islandById, headingVec } from './config.js';
 import { Input } from './input.js';
-import { createFlightState, updateFlight, currentWind } from './flight.js';
-import { buildWorld, heightAt, stripAt, stripCenter } from './world.js';
+import { Flight } from './flight.js';
+import { buildWorld } from './world.js';
 import { buildPlane } from './plane.js';
-import { createMission, currentLeg, scoreLanding, advanceLeg } from './missions.js';
-import { HUD } from './hud.js';
+import { Missions } from './missions.js';
+import { Hud } from './hud.js';
 import { AudioEngine } from './audio.js';
-import { prepareShot, autopilotInput, autopilotTarget } from './shots.js';
+import { applyShot } from './shots.js';
 
 const params = new URLSearchParams(window.location.search);
 const shotName = params.get('shot');
-const FIXED_DT = 1 / 60;
+const SHOT_MODE = !!shotName;
 
+const container = document.getElementById('game');
 const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
-document.getElementById('app').appendChild(renderer.domElement);
+if ('outputColorSpace' in renderer && THREE.SRGBColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
+container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.5, 12000);
-camera.position.set(24, ISLANDS[0].H + 9, 205);
+const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.5, 9000);
+camera.position.set(-40, 30, 80);
 
 const world = buildWorld(scene);
 const plane = buildPlane();
 scene.add(plane.group);
-const hud = new HUD(document);
+
+const flight = new Flight();
+const missions = new Missions();
+const hud = new Hud();
 const audio = new AudioEngine();
 const input = new Input();
-input.attach();
 
-let state = createFlightState();
-let mission = createMission();
-let mode = 'title'; // title | flying | paused | leg | complete | over
-let shotFrozen = false;
-let shotCamera = 'chase';
+const game = {
+  flight,
+  missions,
+  hud,
+  audio,
+  world,
+  plane,
+  input,
+  phase: 'title',
+  best: 0,
+  shot: null,
+  simTime: 0,
+  startGame,
+  backToTitle,
+};
+window.__game = game;
 
-function setMode(m) {
-  mode = m;
-  if (m === 'title') hud.show('title');
-  else if (m === 'paused') hud.show('pause');
-  else if (m === 'flying') hud.hideAll();
+let pausedFrom = 'flying';
+let resultTimer = 0;
+let crashTimer = 0;
+let camOrbit = 0;
+
+function startGame() {
+  missions.reset();
+  flight.resetToRunway('home');
+  game.phase = 'flying';
+  hud.show('none');
+  missions.say('LEG 1 — MEDICAL SUPPLIES TO PALM CAY. FULL THROTTLE, ROTATE AT 46 KT!', 6);
+  audio.start();
+  audio.click();
 }
 
-function startMission() {
-  audio.ensure();
-  setMode('flying');
-  hud.message('LEG 1 — deliver the fish to PALM CAY. W/S throttle, arrows fly.');
-}
-
-function restart() {
-  state = createFlightState();
-  mission = createMission();
-  plane.update(0, state);
-  setMode('flying');
-  hud.message('Fresh plane, full tank. LEG 1 — PALM CAY.');
+function backToTitle() {
+  flight.resetToRunway('home');
+  game.phase = 'title';
+  hud.show('title', { best: game.best });
 }
 
 function nextLeg() {
-  audio.ensure();
-  const leg = currentLeg(mission);
-  setMode('flying');
-  if (leg) hud.message(`LEG ${mission.legIndex + 1} — ${leg.cargo} to ${ISLANDS[leg.to].name}. Wind ${leg.wind.label}.`);
+  const from = missions.fromIsland;
+  flight.resetToRunway(from.id);
+  game.phase = 'flying';
+  hud.show('none');
+  const leg = missions.leg;
+  if (leg) missions.say(`LEG ${missions.legIndex + 1} — ${leg.cargo.toUpperCase()} TO ${missions.dest.name.toUpperCase()}. WIND ${missions.windLabel()}.`, 6);
+  audio.click();
 }
 
-// Shared landing path: flight hook and the delivery shot both use it.
-function handleLanding(info) {
-  const leg = currentLeg(mission);
-  state.fuel = CONFIG.fuelCapacity;
-  state.fuelEmptyAnnounced = false;
-  audio.thud();
-  if (!leg || info.island !== leg.to) {
-    hud.message(`Wrong strip (${ISLANDS[info.island].name}) — refuelled, cargo still aboard. Take off and keep going.`);
+function finishMission() {
+  const bonus = missions.completionBonus();
+  const total = missions.score + bonus;
+  game.best = Math.max(game.best, total);
+  game.phase = 'complete';
+  hud.show('complete', { total, bonus, time: missions.elapsed, legs: missions.legScores });
+  audio.chime();
+}
+
+function gameOver(reason) {
+  game.phase = 'gameover';
+  hud.show('gameover', { reason, score: missions.score, leg: missions.legIndex });
+  audio.alarm();
+}
+
+function respawnAfterCrash() {
+  missions.damage += 1;
+  if (missions.damage >= 3) {
+    gameOver(`${flight.crashReason} — AIRFRAME DESTROYED (3/3 DAMAGE)`);
     return;
   }
-  const rec = scoreLanding(mission, info);
-  audio.chime();
-  const adv = advanceLeg(mission, state.time);
-  if (adv.done) {
-    setMode('complete');
-    hud.showComplete(mission, state);
-  } else {
-    setMode('leg');
-    hud.showLegResult(rec, mission);
-  }
+  const from = missions.fromIsland;
+  flight.resetToRunway(from.id);
+  missions.fuel = 60;
+  game.phase = 'flying';
+  hud.show('none');
+  missions.say(`${flight.crashReason} — DAMAGE ${missions.damage}/3. BACK ON THE RUNWAY, FUEL 60%. FLY CAREFUL!`, 6);
+  audio.alarm();
 }
 
-function handleCrash(info) {
-  state.damage += 1;
+/** Handle a touchdown / crash event returned by the flight model. */
+function handleTouchdown(event) {
+  if (event === 'crash') {
+    respawnAfterCrash();
+    return;
+  }
+  // 'landed' or 'hard': score it only when the strip is the destination.
+  const scored = missions.scoreLanding(flight);
+  if (scored.kind === 'wrong') {
+    if (event === 'hard') {
+      missions.damage += 1;
+      audio.thud();
+      if (missions.damage >= 3) {
+        gameOver('HARD LANDING OFF-RUNWAY — AIRFRAME DESTROYED (3/3 DAMAGE)');
+        return;
+      }
+      missions.say(`ROUGH LANDING — ${scored.detail} DAMAGE ${missions.damage}/3. TAKE OFF AND TRY AGAIN.`, 6);
+    } else {
+      missions.say(`${scored.detail} TAKE OFF AND TRY THE STRIP AGAIN.`, 6);
+    }
+    return;
+  }
+  if (event === 'hard') {
+    missions.damage += 1;
+    if (missions.damage >= 3) {
+      gameOver('HARD LANDING — AIRFRAME DESTROYED (3/3 DAMAGE)');
+      return;
+    }
+  }
   audio.thud();
-  if (state.fuel <= 0) {
-    state.fuel = 25;
-    state.fuelEmptyAnnounced = false;
+  audio.chime();
+  const rec = missions.completeLeg(scored, flight);
+  if (missions.done) {
+    finishMission();
+    return;
   }
-  if (state.damage >= CONFIG.maxDamage) {
-    setMode('over');
-    hud.showGameOver(info.reason, mission);
-  } else {
-    hud.message(`⚠ ${info.reason} — DAMAGE ${state.damage}/3. Throttle up and try again.`, 5);
-  }
+  game.phase = 'result';
+  resultTimer = 0;
+  hud.show('result', { rec, next: `${missions.leg.cargo} → ${missions.dest.name}` });
 }
 
-const hooks = {
-  onLanding: (info) => handleLanding(info),
-  onCrash: (info) => handleCrash(info),
-  onFuelEmpty: () => hud.message('⛽ FUEL EMPTY — gliding! Put her down gently anywhere.', 5),
-};
-
-const game = {
-  get state() {
-    return state;
-  },
-  get mission() {
-    return mission;
-  },
-  get mode() {
-    return mode;
-  },
-  set mode(m) {
-    setMode(m);
-  },
-  setMode,
-  startMission,
-  restart,
-  landNow: (island, info) => handleLanding({ island, ...info }),
-  world: { heightAt, stripAt, stripCenter },
-};
-
-// Buttons.
-const bind = (id, fn) => {
-  const el = document.getElementById(id);
-  if (el) el.addEventListener('click', fn);
-};
-bind('btn-fly', startMission);
-bind('btn-resume', () => setMode('flying'));
-bind('btn-next', nextLeg);
-bind('btn-again', restart);
-bind('btn-again2', restart);
-
-// One physics step with the current control source.
-function stepPhysics(dt, ctl) {
-  const wind = currentLeg(mission) ? currentLeg(mission).wind : { x: 0, z: 0 };
-  updateFlight(state, ctl, dt, wind, hooks);
-}
-
-function keyboardControl() {
+function readControls() {
+  if (game.shot && game.shot.autopilot) return game.shot.autopilot();
   return {
-    throttle: input.throttle,
-    roll: input.roll,
-    pitch: input.pitch,
-    yaw: input.yaw,
-    brake: input.brake,
+    roll: input.rollAxis(),
+    pitch: input.pitchAxis(),
+    rudder: input.rudderAxis(),
+    throttleAxis: input.throttleAxis(),
+    throttleSet: null,
+    flaps: input.down('f') ? 1 : 0,
+    gearDown: game.gearDown,
+    brake: input.down('b'),
   };
 }
 
-function pollEdgeKeys() {
-  if (input.consume('KeyF')) {
-    state.flaps = !state.flaps;
-    hud.message(state.flaps ? 'Flaps down — slower, more lift.' : 'Flaps up.');
-  }
-  if (input.consume('KeyG')) {
-    state.gearDown = !state.gearDown;
-    hud.message(state.gearDown ? 'Gear down.' : 'Gear up.');
-  }
-  if (input.consume('KeyR')) restart();
-  if (input.consume('KeyM')) {
+// Gear is a toggle: G flips it on press.
+game.gearDown = true;
+
+function step(dt) {
+  game.simTime += dt;
+  const shot = game.shot;
+
+  // --- global keys ---
+  if (input.wasPressed('m')) {
     audio.setMuted(!audio.muted);
-    hud.message(audio.muted ? 'Sound muted (M to unmute).' : 'Sound on.');
+    missions.say(audio.muted ? 'SOUND OFF' : 'SOUND ON', 2);
   }
-  if (input.consume('KeyP')) {
-    if (mode === 'flying') setMode('paused');
-    else if (mode === 'paused') setMode('flying');
+  if (input.wasPressed('r') && game.phase !== 'title') {
+    startGame();
+    input.endFrame();
+    return;
   }
-  if (input.consume('Enter')) {
-    if (mode === 'title') startMission();
-    else if (mode === 'leg') nextLeg();
-    else if (mode === 'complete' || mode === 'over') restart();
+
+  if (game.phase === 'title') {
+    if (input.wasPressed('Enter') || input.wasPressed(' ') || input.anyKey) {
+      input.anyKey = false;
+      startGame();
+    }
+    world.update(game.simTime, dt);
+    plane.update(dt, flight.speed, true);
+    // Shot mode: the menu scene still has to advance its own clock, or
+    // window.__shotReady would never fire on the title screen.
+    if (shot) shot.tick(dt);
+    input.endFrame();
+    return;
   }
+
+  if (game.phase === 'paused') {
+    if (input.wasPressed('p') || input.wasPressed('Escape')) {
+      game.phase = pausedFrom;
+      hud.show('none');
+      audio.click();
+    }
+    input.endFrame();
+    return;
+  }
+
+  if (game.phase === 'result') {
+    resultTimer += dt;
+    if (resultTimer > 5 || input.wasPressed('Enter') || input.wasPressed(' ')) nextLeg();
+    plane.update(dt, 0, true);
+    world.update(game.simTime, dt);
+    // Shot mode: the delivery scene must advance its clock while the result
+    // screen is up, or its done() (1 s after the result appears) never fires
+    // and the capture falls back to leg 2's runway instead of the delivery.
+    if (shot) shot.tick(dt);
+    input.endFrame();
+    return;
+  }
+
+  if (game.phase === 'complete' || game.phase === 'gameover') {
+    camOrbit += dt * 0.12;
+    if (input.wasPressed('Enter') || input.wasPressed(' ') || input.wasPressed('r')) startGame();
+    plane.update(dt, 0, flight.gearDown);
+    world.update(game.simTime, dt);
+    if (shot) shot.tick(dt);
+    input.endFrame();
+    return;
+  }
+
+  // --- flying ---
+  if (input.wasPressed('p') || input.wasPressed('Escape')) {
+    pausedFrom = 'flying';
+    game.phase = 'paused';
+    hud.show('pause');
+    input.endFrame();
+    return;
+  }
+  if (!SHOT_MODE && input.wasPressed('g')) {
+    game.gearDown = !game.gearDown;
+    missions.say(game.gearDown ? 'GEAR DOWN' : 'GEAR UP', 2);
+    audio.click();
+  }
+  if (shot) {
+    game.gearDown = flight.gearDown;
+  }
+
+  const ctrl = readControls();
+  const wind = missions.windVector();
+  const event = flight.update(dt, { ...ctrl, gearDown: game.gearDown }, wind);
+  missions.elapsed += dt;
+  const fuelEvent = missions.burnFuel(dt, flight);
+  if (fuelEvent === 'empty') audio.alarm();
+
+  if (event) handleTouchdown(event);
+
+  // Stranded: engine out, stopped on the ground, leg not delivered.
+  if (game.phase === 'flying' && flight.engineOut && flight.onGround && flight.speed < 2) {
+    gameOver('OUT OF FUEL — STRANDED AWAY FROM A RUNWAY');
+  }
+
+  plane.update(dt, flight.speed, game.gearDown);
+  world.update(game.simTime, dt);
+  audio.update(flight.throttle, flight.speed, !flight.onGround);
+  if (shot) shot.tick(dt);
   input.endFrame();
 }
 
-// Chase camera: behind and above the plane, looking ahead.
-// snap=true teleports the camera (used once for staged shots).
-const camTarget = new THREE.Vector3();
-const camPos = new THREE.Vector3(24, ISLANDS[0].H + 9, 205);
-function updateCamera(dt, snap = false) {
-  if (shotCamera === 'menu' && mode === 'title') {
-    const desiredPos = new THREE.Vector3(24, ISLANDS[0].H + 9, 205);
-    const desiredTarget = new THREE.Vector3(0, ISLANDS[0].H + 4, 40);
-    if (snap) {
-      camPos.copy(desiredPos);
-      camTarget.copy(desiredTarget);
-    } else {
-      camPos.lerp(desiredPos, 1 - Math.exp(-dt * 2));
-      camTarget.lerp(desiredTarget, 1 - Math.exp(-dt * 2));
-    }
-  } else {
-    const fx = Math.sin(state.yaw);
-    const fz = Math.cos(state.yaw);
-    const desired = new THREE.Vector3(state.pos.x - fx * 16, state.pos.y + 5.5, state.pos.z - fz * 16);
-    const ground = heightAt(desired.x, desired.z) + 2.5;
-    if (desired.y < ground) desired.y = ground;
-    const desiredTarget = new THREE.Vector3(state.pos.x + fx * 28, state.pos.y + 1.5, state.pos.z + fz * 28);
-    if (snap) {
-      camPos.copy(desired);
-      camTarget.copy(desiredTarget);
-    } else {
-      camPos.lerp(desired, 1 - Math.exp(-dt * 5));
-      camTarget.lerp(desiredTarget, 1 - Math.exp(-dt * 6));
-    }
+function updateCamera(dt) {
+  const f = { x: Math.sin(flight.heading), z: -Math.cos(flight.heading) };
+  if (game.phase === 'title' && game.shot && game.shot.camera === 'menu') {
+    // Menu shot: the title card covers the centre of the frame, so aim the
+    // camera at a point right of and above the plane — the plane lands
+    // lower-left of the card, on the runway at sunset, instead of behind it.
+    const home = islandById('home');
+    const hf = headingVec(home.runwayHeading);
+    const rx = -hf.z;
+    const rz = hf.x; // unit vector to the plane's right
+    camera.position.set(
+      flight.x - hf.x * 40 - rx * 4,
+      flight.y + 6,
+      flight.z - hf.z * 40 - rz * 4,
+    );
+    camera.lookAt(flight.x + rx * 10, flight.y + 18, flight.z + rz * 10);
+    return;
   }
-  camera.position.copy(camPos);
-  camera.lookAt(camTarget);
+  if (game.phase === 'title') {
+    camera.position.set(flight.x - f.x * 30 + 24, flight.y + 8, flight.z - f.z * 30 + 26);
+    camera.lookAt(flight.x, flight.y + 1, flight.z);
+    return;
+  }
+  if (game.phase === 'complete' || game.phase === 'gameover') {
+    const r = 26;
+    camera.position.set(
+      flight.x + Math.cos(camOrbit) * r,
+      flight.y + 9,
+      flight.z + Math.sin(camOrbit) * r,
+    );
+    camera.lookAt(flight.x, flight.y + 1, flight.z);
+    return;
+  }
+  // Chase camera: behind and above, eased toward its target.
+  const dist = flight.onGround ? 15 : 17;
+  const height = flight.onGround ? 4.6 : 5.4;
+  const tx = flight.x - f.x * dist;
+  const ty = flight.y + height;
+  const tz = flight.z - f.z * dist;
+  const k = 1 - Math.exp(-dt * 4.5);
+  camera.position.x += (tx - camera.position.x) * k;
+  camera.position.y += (ty - camera.position.y) * k;
+  camera.position.z += (tz - camera.position.z) * k;
+  camera.lookAt(flight.x + f.x * 20, flight.y + 1.2, flight.z + f.z * 20);
 }
 
-function renderFrame(dt) {
-  world.update(dt);
-  plane.update(dt, state);
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - (frame.last || now)) / 1000 || 0.016);
+  frame.last = now;
+  step(dt);
   updateCamera(dt);
-  hud.update(state, mission, mode);
-  audio.update(state);
+  // Plane mesh follows the flight model. Nose is local -Z, heading 0 = -Z.
+  plane.group.position.set(flight.x, flight.y, flight.z);
+  plane.group.rotation.order = 'YXZ';
+  plane.group.rotation.y = -flight.heading;
+  plane.group.rotation.x = flight.pitch;
+  plane.group.rotation.z = -flight.roll;
+  hud.update({ flight, missions, phase: game.phase, time: game.simTime });
   renderer.render(scene, camera);
 }
-
-// ---- shot mode: deterministic staged scenes ----
-let shotSpec = null;
-if (shotName) {
-  shotSpec = prepareShot(shotName, game);
-  shotCamera = shotSpec.camera || 'chase';
-  if (shotSpec.seconds > 0 && shotSpec.autopilot) {
-    const steps = Math.round(shotSpec.seconds / FIXED_DT);
-    for (let i = 0; i < steps; i++) {
-      const tgt = autopilotTarget(game, shotSpec.autopilot);
-      const ctl = autopilotInput(state, tgt.target, tgt.alt, tgt.throttle);
-      stepPhysics(FIXED_DT, ctl);
-      world.update(FIXED_DT);
-      if (mode !== 'flying') break; // landed / crashed mid-shot: keep the frame
-    }
-  }
-  renderFrame(FIXED_DT);
-  updateCamera(FIXED_DT, true); // snap: no lerp frames before the screenshot
-  hud.update(state, mission, mode);
-  renderer.render(scene, camera);
-  shotFrozen = true;
-  window.__shotReady = true;
-}
-
-// ---- live loop ----
-let last = performance.now();
-let acc = 0;
-function loop(now) {
-  requestAnimationFrame(loop);
-  const dtReal = Math.min(0.1, (now - last) / 1000);
-  last = now;
-  if (!shotFrozen) {
-    pollEdgeKeys();
-    if (mode === 'flying') {
-      acc += dtReal;
-      let n = 0;
-      while (acc >= FIXED_DT && n < 4) {
-        stepPhysics(FIXED_DT, keyboardControl());
-        acc -= FIXED_DT;
-        n++;
-        if (mode !== 'flying') {
-          acc = 0;
-          break;
-        }
-      }
-    }
-    renderFrame(dtReal);
-  } else {
-    renderer.render(scene, camera);
-  }
-}
-requestAnimationFrame(loop);
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -287,5 +342,18 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-window.__cargo = game;
-window.__shotReady = window.__shotReady === true;
+// Click / tap: title starts, result screen continues.
+renderer.domElement.addEventListener('pointerdown', () => {
+  if (game.phase === 'title') startGame();
+  else if (game.phase === 'result') nextLeg();
+});
+
+// --- boot ---
+if (SHOT_MODE) {
+  applyShot(shotName, game);
+  hud.show(game.phase === 'title' ? 'title' : 'none', { best: 0 });
+} else {
+  hud.show('title', { best: 0 });
+}
+window.__shotReady = window.__shotReady || false;
+requestAnimationFrame(frame);

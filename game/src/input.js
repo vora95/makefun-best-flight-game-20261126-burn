@@ -1,61 +1,70 @@
-// Sunset Cargo Run — input: keyboard state + edge-triggered toggles.
-// Controls: W/S throttle, Arrow Left/Right roll, Arrow Up/Down pitch,
-// A/D rudder, F flaps, G gear, B brake (hold), R restart, P pause, M mute.
+// Keyboard input: held keys plus edge-triggered actions (flaps, gear, pause, ...).
+
 export class Input {
   constructor() {
     this.keys = new Set();
-    this.pressed = new Set(); // edge: codes pressed since last consume
+    this.pressed = new Set(); // keys pressed since last consume()
+    this.anyKey = false;
     this.onKeyDown = (e) => {
-      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
-      if (!e.repeat) this.pressed.add(e.code);
-      this.keys.add(e.code);
+      if (e.repeat) return;
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      this.keys.add(k);
+      this.pressed.add(k);
+      this.anyKey = true;
+      // Keep the page from scrolling on game keys.
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
     };
-    this.onKeyUp = (e) => this.keys.delete(e.code);
+    this.onKeyUp = (e) => {
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      this.keys.delete(k);
+    };
+    window.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('blur', () => this.keys.clear());
   }
 
-  attach(target = window) {
-    target.addEventListener('keydown', this.onKeyDown);
-    target.addEventListener('keyup', this.onKeyUp);
+  down(k) {
+    return this.keys.has(k);
   }
 
-  down(code) {
-    return this.keys.has(code);
-  }
-
-  // True once per physical press; call once per frame per action.
-  consume(code) {
-    if (this.pressed.has(code)) {
-      this.pressed.delete(code);
-      return true;
-    }
-    return false;
+  /** True once per physical press; call after reading each frame. */
+  wasPressed(k) {
+    return this.pressed.has(k);
   }
 
   endFrame() {
     this.pressed.clear();
   }
 
-  // -1..1 throttle change request (W up, S down).
-  get throttle() {
-    return (this.down('KeyW') ? 1 : 0) - (this.down('KeyS') ? 1 : 0);
+  /** -1..1 roll input: ArrowLeft/Right. */
+  rollAxis() {
+    let v = 0;
+    if (this.down('ArrowLeft')) v -= 1;
+    if (this.down('ArrowRight')) v += 1;
+    return v;
   }
 
-  // -1..1 roll: ArrowRight banks right (+1), ArrowLeft banks left.
-  get roll() {
-    return (this.down('ArrowRight') ? 1 : 0) - (this.down('ArrowLeft') ? 1 : 0);
+  /** -1..1 pitch input: ArrowUp pitches down (stick forward), ArrowDown pitches up. */
+  pitchAxis() {
+    let v = 0;
+    if (this.down('ArrowUp')) v -= 1;
+    if (this.down('ArrowDown')) v += 1;
+    return v;
   }
 
-  // -1..1 pitch: ArrowUp pulls nose up (+1), ArrowDown pushes down.
-  get pitch() {
-    return (this.down('ArrowUp') ? 1 : 0) - (this.down('ArrowDown') ? 1 : 0);
+  /** -1..1 rudder input: A/D. */
+  rudderAxis() {
+    let v = 0;
+    if (this.down('a')) v -= 1;
+    if (this.down('d')) v += 1;
+    return v;
   }
 
-  // -1..1 rudder: D right, A left.
-  get yaw() {
-    return (this.down('KeyD') ? 1 : 0) - (this.down('KeyA') ? 1 : 0);
-  }
-
-  get brake() {
-    return this.down('KeyB');
+  /** -1..1 throttle input: W/S or ArrowUp/Down are pitch; W/S only for throttle. */
+  throttleAxis() {
+    let v = 0;
+    if (this.down('w')) v += 1;
+    if (this.down('s')) v -= 1;
+    return v;
   }
 }

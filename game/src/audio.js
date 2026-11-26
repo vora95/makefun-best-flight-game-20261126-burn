@@ -1,43 +1,53 @@
-// Sunset Cargo Run — audio: fully procedural WebAudio, no external files.
-// Engine hum follows throttle; wind rush follows airspeed; thud + chime cues.
+// Procedural WebAudio: engine drone that follows the throttle, wind rush,
+// landing thud and delivery chime. No audio files.
+
 export class AudioEngine {
   constructor() {
     this.ctx = null;
-    this.muted = false;
+    this.master = null;
     this.engineOsc = null;
     this.engineOsc2 = null;
     this.engineGain = null;
-    this.windGain = null;
+    this.engineFilter = null;
+    this.noiseGain = null;
+    this.muted = false;
+    this.started = false;
   }
 
-  ensure() {
-    if (this.ctx) {
-      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+  /** Must be called from a user gesture (or a shot) — creates the context. */
+  start() {
+    if (this.started) {
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
       return;
     }
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return;
       this.ctx = new AC();
-      // Engine: two detuned saws through a lowpass.
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : 0.5;
+      this.master.connect(this.ctx.destination);
+
+      // Engine: two detuned saws through a low-pass.
+      this.engineFilter = this.ctx.createBiquadFilter();
+      this.engineFilter.type = 'lowpass';
+      this.engineFilter.frequency.value = 420;
+      this.engineFilter.Q.value = 1.2;
       this.engineGain = this.ctx.createGain();
       this.engineGain.gain.value = 0;
-      const filter = this.ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.value = 420;
       this.engineOsc = this.ctx.createOscillator();
       this.engineOsc.type = 'sawtooth';
       this.engineOsc.frequency.value = 62;
       this.engineOsc2 = this.ctx.createOscillator();
       this.engineOsc2.type = 'sawtooth';
       this.engineOsc2.frequency.value = 93;
-      this.engineOsc.connect(filter);
-      this.engineOsc2.connect(filter);
-      filter.connect(this.engineGain);
-      this.engineGain.connect(this.ctx.destination);
+      this.engineOsc.connect(this.engineFilter);
+      this.engineOsc2.connect(this.engineFilter);
+      this.engineFilter.connect(this.engineGain);
+      this.engineGain.connect(this.master);
       this.engineOsc.start();
       this.engineOsc2.start();
-      // Wind: looped noise through a bandpass.
+
+      // Wind: looped filtered noise.
       const len = this.ctx.sampleRate * 2;
       const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
       const data = buf.getChannelData(0);
@@ -45,68 +55,74 @@ export class AudioEngine {
       const noise = this.ctx.createBufferSource();
       noise.buffer = buf;
       noise.loop = true;
-      const bp = this.ctx.createBiquadFilter();
-      bp.type = 'bandpass';
-      bp.frequency.value = 700;
-      this.windGain = this.ctx.createGain();
-      this.windGain.gain.value = 0;
-      noise.connect(bp);
-      bp.connect(this.windGain);
-      this.windGain.connect(this.ctx.destination);
+      const noiseFilter = this.ctx.createBiquadFilter();
+      noiseFilter.type = 'bandpass';
+      noiseFilter.frequency.value = 700;
+      noiseFilter.Q.value = 0.6;
+      this.noiseGain = this.ctx.createGain();
+      this.noiseGain.gain.value = 0;
+      noise.connect(noiseFilter);
+      noiseFilter.connect(this.noiseGain);
+      this.noiseGain.connect(this.master);
       noise.start();
+      this.started = true;
     } catch {
-      this.ctx = null;
+      this.started = false;
     }
+  }
+
+  /** Per-frame: throttle 0..1, speed m/s, airborne bool. */
+  update(throttle, speed, airborne) {
+    if (!this.started || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    const rpm = 46 + throttle * 66;
+    this.engineOsc.frequency.setTargetAtTime(rpm, t, 0.08);
+    this.engineOsc2.frequency.setTargetAtTime(rpm * 1.494, t, 0.08);
+    this.engineFilter.frequency.setTargetAtTime(300 + throttle * 900, t, 0.1);
+    const eng = airborne || throttle > 0.05 ? 0.05 + throttle * 0.11 : 0;
+    this.engineGain.gain.setTargetAtTime(eng, t, 0.1);
+    const wind = airborne ? Math.min(0.12, speed * 0.0022) : 0;
+    this.noiseGain.gain.setTargetAtTime(wind, t, 0.15);
   }
 
   setMuted(m) {
     this.muted = m;
-    if (this.ctx && this.engineGain) this.engineGain.gain.value = 0;
-    if (this.ctx && this.windGain) this.windGain.gain.value = 0;
+    if (this.master && this.ctx) this.master.gain.setTargetAtTime(m ? 0 : 0.5, this.ctx.currentTime, 0.05);
   }
 
-  update(state) {
-    if (!this.ctx || this.muted) return;
-    const t = this.ctx.currentTime;
-    const thr = state.throttle;
-    this.engineOsc.frequency.setTargetAtTime(55 + thr * 95, t, 0.1);
-    this.engineOsc2.frequency.setTargetAtTime(82 + thr * 140, t, 0.1);
-    this.engineGain.gain.setTargetAtTime(state.airborne || thr > 0.05 ? 0.035 + thr * 0.05 : 0, t, 0.15);
-    this.windGain.gain.setTargetAtTime(state.airborne ? Math.min(0.06, state.speed * 0.0012) : 0, t, 0.2);
+  _tone(freq, dur, type, vol, when = 0) {
+    if (!this.started || !this.ctx) return;
+    const t0 = this.ctx.currentTime + when;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t0);
+    o.stop(t0 + dur + 0.05);
   }
 
   thud() {
-    if (!this.ctx || this.muted) return;
-    const t = this.ctx.currentTime;
-    const osc = this.ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(90, t);
-    osc.frequency.exponentialRampToValueAtTime(35, t + 0.18);
-    const g = this.ctx.createGain();
-    g.gain.setValueAtTime(0.25, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
-    osc.connect(g);
-    g.connect(this.ctx.destination);
-    osc.start(t);
-    osc.stop(t + 0.25);
+    this._tone(70, 0.25, 'sine', 0.5);
+    this._tone(48, 0.35, 'triangle', 0.4, 0.02);
   }
 
   chime() {
-    if (!this.ctx || this.muted) return;
-    const t = this.ctx.currentTime;
-    for (const [i, freq] of [523.25, 659.25, 783.99].entries()) {
-      const osc = this.ctx.createOscillator();
-      osc.type = 'sine';
-      osc.frequency.value = freq;
-      const g = this.ctx.createGain();
-      const start = t + i * 0.09;
-      g.gain.setValueAtTime(0.0001, start);
-      g.gain.exponentialRampToValueAtTime(0.14, start + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.001, start + 0.5);
-      osc.connect(g);
-      g.connect(this.ctx.destination);
-      osc.start(start);
-      osc.stop(start + 0.55);
-    }
+    this._tone(523, 0.35, 'sine', 0.3);
+    this._tone(659, 0.35, 'sine', 0.3, 0.12);
+    this._tone(784, 0.6, 'sine', 0.32, 0.24);
+  }
+
+  alarm() {
+    this._tone(880, 0.18, 'square', 0.16);
+    this._tone(880, 0.18, 'square', 0.16, 0.25);
+  }
+
+  click() {
+    this._tone(1200, 0.06, 'square', 0.12);
   }
 }
